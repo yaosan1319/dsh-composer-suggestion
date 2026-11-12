@@ -13,13 +13,18 @@ DeepSeek Harness 输入框里的「续写推荐」：正在输入时，光标处
 
 ## 安装
 
-从插件市场的条目安装，或直接：
+界面路径：**插件 → 添加插件**，按情况粘贴：
 
-```sh
-dsh plugin install dsh-composer-suggestion
-```
+| 情况 | 粘贴内容 |
+|---|---|
+| 已发布到 npm | `dsh-composer-suggestion`（或锁定版本 `dsh-composer-suggestion@1.1.0`） |
+| 尚未发布 npm | `git+https://github.com/yaosan1319/dsh-composer-suggestion.git` |
 
-在本目录下也可以让 Harness 代理由插件管理器安装（`install_bundle`，target 指向本目录）。
+`git+` 前缀与结尾的 `.git` 都不能省；直接填 `https://github.com/...` 会被当作 npm 包名解析并以 404 失败。Git 安装会先 `git ls-remote`，因此需要对 GitHub 的 HTTPS 可达（或已配置代理）。
+
+条目进入社区目录后，同一个包也能在 **插件 → 插件市场** 里一键安装。
+
+在本仓库目录下，也可以让 Harness 的插件管理器直接安装（`install_bundle`，target 指向本目录）。
 
 ## 与 DSH 的接线
 

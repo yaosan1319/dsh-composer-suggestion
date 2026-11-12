@@ -19,14 +19,23 @@ nothing — so the interaction never blocks on the network.
 
 ## Install
 
-From a marketplace entry, or directly:
+Through the GUI: **Plugins → Add plugin**, then paste one of these.
 
-```sh
-dsh plugin install dsh-composer-suggestion
-```
+| Situation | Paste |
+|---|---|
+| Published to npm | `dsh-composer-suggestion` (or a pinned `dsh-composer-suggestion@1.1.0`) |
+| Not on npm yet | `git+https://github.com/yaosan1319/dsh-composer-suggestion.git` |
 
-Or from this directory, from the Harness agent: the bundle is installable with
-the plugin manager (`install_bundle`, target = this directory).
+The `git+` scheme and the trailing `.git` are both required; a bare
+`https://github.com/...` address is read as an npm package name and fails with
+404. A Git install runs `git ls-remote` first, so it needs reachable HTTPS to
+GitHub (or a configured proxy).
+
+Once the entry is in the community catalog, the same bundle also installs from
+**Plugins → Marketplace** with one click.
+
+From a checkout of this repository, the Harness agent can install it directly:
+plugin manager `install_bundle` with this directory as the target.
 
 ## How it wires into DSH
 
