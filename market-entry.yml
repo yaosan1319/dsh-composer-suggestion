@@ -1,0 +1,6 @@
+url: https://github.com/yaosan1319/dsh-composer-suggestion
+name: yaosan1319/dsh-composer-suggestion
+category: ui
+description:
+  en: Ghost continuation prompt inside the DSH composer, generated from the current session and filled with Tab.
+  zh: 在输入框内以幽灵文字推荐续写提示词，内容由当前会话经模型生成，按 Tab 一键填充。
