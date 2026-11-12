@@ -1,0 +1,5 @@
+- insert:
+    - id: composer-suggestion
+      name: 'dsh-composer-suggestion'
+    - id: composer-suggestion-host
+      name: 'dsh-composer-suggestion/host'

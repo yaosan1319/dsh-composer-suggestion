@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Composer Suggestion",
+    "description": "Shows a suggested continuation prompt as ghost text inside the composer; press Tab to fill it in."
+  }
+}
