@@ -15,9 +15,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kingcharleslzy-ai/dsh-composer-suggestion.git"
+    "url": "git+https://github.com/yaosan1319/dsh-composer-suggestion.git"
   },
-  "homepage": "https://github.com/kingcharleslzy-ai/dsh-composer-suggestion#readme",
+  "homepage": "https://github.com/yaosan1319/dsh-composer-suggestion#readme",
   "engines": {
     "dsh": ">=0.2.1-rc.1"
   },
@@ -40,11 +40,15 @@
     "LICENSE"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,
-      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   },
   "publishConfig": {
