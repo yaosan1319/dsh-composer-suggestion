@@ -1,19 +1,20 @@
 name: release
 
-# Pushing a tag such as v1.1.0 publishes that exact version to npm.
-# Requires the repository secret NPM_TOKEN: an npm automation token with
-# publish rights for the package name.
+# A tag such as v1.3.0 publishes a GitHub Release for that version, and also
+# publishes the package to npm when the repository secret NPM_TOKEN exists.
+# Without that secret the npm step is skipped and the run stays green, so a tag
+# alone is always a valid release marker.
 on:
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +22,7 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+
       - name: Check the tag matches package.json
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -29,7 +31,29 @@ jobs:
             echo "tag $tag does not match package version $version" >&2
             exit 1
           fi
-      - name: Publish
-        run: npm publish --provenance --access public
+
+      - name: Unit checks
+        run: npm test
+
+      - name: Build the package tarball
+        run: npm pack
+
+      - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "NPM_TOKEN is not configured; skipping npm publish." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          npm publish --provenance --access public
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "$(ls dsh-composer-suggestion-*.tgz)" \
+            || echo "release ${GITHUB_REF_NAME} already exists"
