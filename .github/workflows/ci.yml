@@ -18,5 +18,7 @@ jobs:
           for file in index.js host.js client.js; do
             node --check "$file"
           done
+      - name: Unit checks
+        run: npm test
       - name: Verify the package manifest and file list
         run: npm pack --dry-run

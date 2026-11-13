@@ -17,6 +17,10 @@ Client half renders the answer. A built-in phrase bank renders instantly and
 stays as the fallback whenever the Host is unreachable, slow, or returns
 nothing — so the interaction never blocks on the network.
 
+Suggestions appear only once the composer has focus, never for a draft that looks
+like a credential, and `Tab` is consumed only when the ghost text really lands in
+the draft — mid-sentence editing keeps the native button behaviour.
+
 ## Install
 
 Through the GUI: **Plugins → Add plugin**, then paste one of these.
@@ -70,7 +74,7 @@ server; it has no authentication of its own beyond the header above.
 
 ## Compatibility
 
-Requires `dsh >= 0.2.1` (the `conversation.input.overlay` and
+Requires `dsh >= 0.2.1-rc.1` (the `conversation.input.overlay` and
 `conversation.composer.dock` slots plus the `inputActions` draft API).
 
 ## License

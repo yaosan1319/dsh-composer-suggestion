@@ -7,9 +7,14 @@ window.__ModuleLoader__.load({
 
     const NS = 'dsh-composer-suggestion';
     const ROUTE = '/dsh-composer-suggestion/suggest';
+    const DRAFT_LIMIT = 400;
+    const MIN_ROOM_PX = 80;
 
-    const ZH = { hint: '按 Tab 补全', dismiss: 'Esc 忽略' };
-    const EN = { hint: 'Tab to complete', dismiss: 'Esc to dismiss' };
+    const ZH = { hint: '按 Tab 补全', dismiss: 'Esc 忽略', empty: '打开输入框后给建议' };
+    const EN = { hint: 'Tab to complete', dismiss: 'Esc to dismiss', empty: 'Suggestions appear once you focus the composer' };
+
+    /** Credential shapes that must never leave the composer. */
+    const SECRET_PATTERN = /(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]+PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|token|password|secret)\s*[:=]\s*\S{8,})/iu;
 
     /** Full sentences the inline ghost can complete a half-typed draft into. */
     const ZH_PREFIX = [
@@ -76,12 +81,39 @@ window.__ModuleLoader__.load({
       'Give me a simpler approach',
     ];
 
+    function hasCjk(text) {
+      return /[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/u.test(String(text || ''));
+    }
+
+    function hasLatin(text) {
+      return /[A-Za-z]/.test(String(text || ''));
+    }
+
+    /** Draft decides the wording language; the UI locale is only the fallback. */
+    function resolveLanguage(draft, uiLanguage) {
+      const text = String(draft || '');
+      if (hasCjk(text)) return 'zh';
+      if (hasLatin(text)) return 'en';
+      return String(uiLanguage || '').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+    }
+
     function banksFor(language) {
       const zh = String(language || '').toLowerCase().startsWith('zh');
       return {
         sentences: zh ? ZH_PREFIX : EN_PREFIX,
         recommends: zh ? ZH_RECOMMEND : EN_RECOMMEND,
       };
+    }
+
+    function looksSecret(text) {
+      return SECRET_PATTERN.test(String(text || ''));
+    }
+
+    /** Editor offsets may count code points; tolerate either coordinate system. */
+    function codePointLength(text) {
+      let length = 0;
+      for (const _ of String(text || '')) length += 1;
+      return length;
     }
 
     function hashOf(text) {
@@ -114,9 +146,32 @@ window.__ModuleLoader__.load({
       return best;
     }
 
-    /** Reuse a recent recommendation so repeated focus/blur does not re-bill the model. */
+    /** Bounded cache of model recommendations, keyed by session, language and mode. */
     const recommendCache = new Map();
     const RECOMMEND_TTL_MS = 45000;
+    const RECOMMEND_CACHE_MAX = 32;
+
+    function cacheGet(key) {
+      const hit = recommendCache.get(key);
+      if (!hit) return null;
+      if (Date.now() - hit.at >= RECOMMEND_TTL_MS) {
+        recommendCache.delete(key);
+        return null;
+      }
+      recommendCache.delete(key);
+      recommendCache.set(key, hit);
+      return hit;
+    }
+
+    function cacheSet(key, text) {
+      recommendCache.delete(key);
+      recommendCache.set(key, { text, at: Date.now() });
+      while (recommendCache.size > RECOMMEND_CACHE_MAX) {
+        const oldest = recommendCache.keys().next();
+        if (oldest.done) break;
+        recommendCache.delete(oldest.value);
+      }
+    }
 
     /**
      * One model suggestion from the Host route.
@@ -160,7 +215,7 @@ window.__ModuleLoader__.load({
       if (!Number.isFinite(lineHeight) || lineHeight <= 0) {
         lineHeight = (parseFloat(style ? style.fontSize : '') || 16) * 1.5;
       }
-      return { left: box.left + paddingLeft, top: box.top + paddingTop, height: lineHeight, width: 0 };
+      return { left: box.left + paddingLeft, top: box.top + paddingTop, height: lineHeight, width: 0, right: box.left + paddingLeft };
     }
 
     /** The focused draft editor, but only while its own selection is inside it. */
@@ -174,7 +229,11 @@ window.__ModuleLoader__.load({
       return active;
     }
 
-    /** Insert text at the caret, but only while the caret sits at the draft end. */
+    /**
+     * Insert text at the caret.
+     * @returns true only when the draft really changed, so the caller can decide
+     * whether to consume the key event.
+     */
     function insertAtCaret(inputActions, text, draft) {
       if (!inputActions || !text) return false;
       let span = null;
@@ -183,13 +242,17 @@ window.__ModuleLoader__.load({
       } catch (error) {
         return false;
       }
+      if (!span || span.start !== span.end) return false;
       const length = String(draft || '').length;
-      if (!span || span.start !== span.end || span.end !== length) return false;
+      if (span.end !== length && span.end !== codePointLength(draft)) return false;
+      let result;
       try {
-        return inputActions.insertText(text, span) === true;
+        result = inputActions.insertText(text, span);
       } catch (error) {
         return false;
       }
+      // A void return means the API accepted the edit; only an explicit false is a refusal.
+      return result !== false;
     }
 
     const BADGE = {
@@ -208,31 +271,84 @@ window.__ModuleLoader__.load({
       flex: '0 0 auto',
     };
 
+    /** Composer state plus whether the draft editor currently owns focus. */
     function useComposerState(props) {
       const { useInput } = props;
       const draft = useInput ? useInput((state) => state.draft) : '';
       const revision = useInput ? useInput((state) => state.draftRev) : 0;
       const phase = useInput ? useInput((state) => state.phase) : 'plain';
-      const language = (props.getLanguage && props.getLanguage()) || 'en';
+      const uiLanguage = (props.getLanguage && props.getLanguage()) || 'en';
+      const language = resolveLanguage(draft, uiLanguage);
       const banks = useMemo(() => banksFor(language), [language]);
       const blocked = phase === 'submitting' || phase === 'adjudicating';
-      return { draft, revision, language, banks, blocked };
+
+      const [focused, setFocused] = useState(false);
+      // Auto-focus on session open must not count as engagement, otherwise the
+      // transcript is sent to the model before the user ever touches the composer.
+      const [engaged, setEngaged] = useState(false);
+      const [imeEpoch, setImeEpoch] = useState(0);
+      const composing = useRef(false);
+
+      useEffect(() => {
+        const onFocusIn = (event) => {
+          const target = event.target;
+          if (target && target.isContentEditable) setFocused(true);
+        };
+        const onFocusOut = () => setFocused(false);
+        // Engagement requires a real interaction whose target is the draft editor:
+        // a sidebar click, an auto-focus, or a press elsewhere never qualifies.
+        const onPointerDown = (event) => {
+          const target = event.target;
+          const editor = target && target.closest ? target.closest('[contenteditable="true"]') : null;
+          if (editor && editor.isContentEditable) setEngaged(true);
+        };
+        const onKeyDown = (event) => {
+          const target = event.target;
+          if (target && target.isContentEditable) setEngaged(true);
+        };
+        const onCompositionStart = () => {
+          composing.current = true;
+        };
+        const onCompositionEnd = () => {
+          composing.current = false;
+          setImeEpoch((value) => value + 1);
+        };
+        document.addEventListener('focusin', onFocusIn, true);
+        document.addEventListener('focusout', onFocusOut, true);
+        document.addEventListener('pointerdown', onPointerDown, true);
+        document.addEventListener('keydown', onKeyDown, true);
+        document.addEventListener('compositionstart', onCompositionStart, true);
+        document.addEventListener('compositionend', onCompositionEnd, true);
+        setFocused(focusedEditor() !== null);
+        return () => {
+          document.removeEventListener('focusin', onFocusIn, true);
+          document.removeEventListener('focusout', onFocusOut, true);
+          document.removeEventListener('pointerdown', onPointerDown, true);
+          document.removeEventListener('keydown', onKeyDown, true);
+          document.removeEventListener('compositionstart', onCompositionStart, true);
+          document.removeEventListener('compositionend', onCompositionEnd, true);
+        };
+      }, []);
+
+
+      return { draft, revision, language, banks, blocked, focused, engaged, imeEpoch, composing };
     }
 
     /** Ask the Host for a model suggestion once the draft has been idle for a moment. */
-    function useModelSuggestion({ props, draft, revision, language, blocked, mode, idleMs }) {
+    function useModelSuggestion({ props, draft, revision, language, blocked, focused, engaged, imeEpoch, composing, mode, idleMs }) {
       const [state, setState] = useState(null);
       const draftRef = useRef(draft);
       draftRef.current = draft;
 
       useEffect(() => {
-        if (blocked) return undefined;
+        if (blocked || !engaged) return undefined;
+        if (composing && composing.current) return undefined;
         if (mode === 'continuation' && String(draft || '').trim().length === 0) return undefined;
         if (mode === 'recommend' && String(draft || '') !== '') return undefined;
-        const cacheKey = `${props.sessionId || 'none'}:${mode}`;
+        const cacheKey = `${props.sessionId || 'none'}:${language}:${mode}`;
         if (mode === 'recommend') {
-          const hit = recommendCache.get(cacheKey);
-          if (hit && Date.now() - hit.at < RECOMMEND_TTL_MS) {
+          const hit = cacheGet(cacheKey);
+          if (hit) {
             setState({ draft: String(draft || ''), text: hit.text });
             return undefined;
           }
@@ -240,7 +356,8 @@ window.__ModuleLoader__.load({
         const controller = new AbortController();
         let cancelled = false;
         const timer = setTimeout(() => {
-          const sent = String(draft || '');
+          const sent = String(draft || '').slice(0, DRAFT_LIMIT);
+          if (looksSecret(sent)) return;
           requestSuggestion({
             mode,
             draft: sent,
@@ -249,9 +366,9 @@ window.__ModuleLoader__.load({
           }, controller.signal).then((text) => {
             if (cancelled || !text) return;
             // Discard an answer that no longer matches what the user is typing.
-            if (String(draftRef.current || '') !== sent) return;
-            if (mode === 'recommend') recommendCache.set(cacheKey, { text, at: Date.now() });
-            setState({ draft: sent, text });
+            if (String(draftRef.current || '').slice(0, DRAFT_LIMIT) !== sent) return;
+            if (mode === 'recommend') cacheSet(cacheKey, text);
+            setState({ draft: String(draftRef.current || ''), text });
           }, () => {});
         }, idleMs);
         return () => {
@@ -259,7 +376,7 @@ window.__ModuleLoader__.load({
           clearTimeout(timer);
           controller.abort();
         };
-      }, [draft, revision, language, blocked, mode, idleMs, props.sessionId]);
+      }, [draft, revision, language, blocked, focused, engaged, imeEpoch, mode, idleMs, props.sessionId, composing]);
 
       return state;
     }
@@ -267,7 +384,8 @@ window.__ModuleLoader__.load({
     /** Inline ghost completion appended at the caret of a non-empty draft. */
     function ComposerSuggestion(props) {
       const { inputActions } = props;
-      const { draft, revision, language, banks, blocked } = useComposerState(props);
+      const state = useComposerState(props);
+      const { draft, revision, language, banks, blocked, focused, engaged } = state;
       const [tail, setTail] = useState(null);
       const [layout, setLayout] = useState(null);
 
@@ -280,7 +398,8 @@ window.__ModuleLoader__.load({
       tailRef.current = tail;
 
       const model = useModelSuggestion({
-        props, draft, revision, language, blocked,
+        props, draft, revision, language, blocked, focused, engaged,
+        imeEpoch: state.imeEpoch, composing: state.composing,
         mode: 'continuation',
         idleMs: 700,
       });
@@ -308,8 +427,17 @@ window.__ModuleLoader__.load({
         } catch (error) {
           span = null;
         }
-        const length = String(draftRef.current || '').length;
-        if (span && (span.start !== span.end || span.end !== length)) {
+        const draftText = String(draftRef.current || '');
+        if (span && (span.start !== span.end
+          || (span.end !== draftText.length && span.end !== codePointLength(draftText)))) {
+          setLayout(null);
+          return;
+        }
+        // Truncate inside the card instead of sliding left over the typed text.
+        const editorBox = editor.getBoundingClientRect();
+        const right = editorBox.right;
+        const room = Math.floor(right - caret.left);
+        if (!Number.isFinite(room) || room < MIN_ROOM_PX) {
           setLayout(null);
           return;
         }
@@ -321,54 +449,50 @@ window.__ModuleLoader__.load({
           setLayout(null);
           return;
         }
-        let dx = caret.left - box.left;
+        const dx = caret.left - box.left;
         const dy = caret.top + (caret.height - box.height) / 2 - box.top;
-        const margin = 12;
-        const overflowRight = box.left + dx + box.width - (window.innerWidth - margin);
-        if (overflowRight > 0) dx -= overflowRight;
-        const overflowLeft = margin - (box.left + dx);
-        if (overflowLeft > 0) dx += overflowLeft;
         setLayout({
           dx,
           dy,
+          room,
           fontFamily: style.fontFamily,
           fontSize: style.fontSize,
           lineHeight: style.lineHeight,
         });
       }, [inputActions]);
 
+      /** @returns true only when the suggestion really landed in the draft. */
       const accept = useCallback(() => {
         const text = tailRef.current;
-        const draftNow = draftRef.current;
-        if (!text) return;
-        if (insertAtCaret(inputActions, text, draftNow)) {
-          dismissedRef.current = String(draftNow || '') + text;
-          tailRef.current = null;
-          setTail(null);
-          setLayout(null);
-        }
+        if (!text) return false;
+        const draftNow = String(draftRef.current || '');
+        const landed = insertAtCaret(inputActions, text, draftNow);
+        if (!landed) return false;
+        dismissedRef.current = draftNow + text;
+        tailRef.current = null;
+        setTail(null);
+        setLayout(null);
+        return true;
       }, [inputActions]);
 
       useEffect(() => {
-        if (blocked || draft === dismissedRef.current) {
+        if (blocked || !engaged || !focused || draft === dismissedRef.current) {
           setTail(null);
           setLayout(null);
           return;
         }
         const trimmed = String(draft || '').replace(/\s+$/u, '');
-        if (!trimmed) {
+        if (!trimmed || looksSecret(trimmed)) {
           setTail(null);
           return;
         }
         let next = null;
         if (model && model.draft === draft) {
-          // The model returns the continuation to append; strip an echoed draft.
-          next = model.text.startsWith(trimmed) ? model.text.slice(trimmed.length) : model.text;
-          next = next.replace(/^\s+/u, '');
+          next = (model.text.startsWith(trimmed) ? model.text.slice(trimmed.length) : model.text).replace(/^\s+/u, '');
         }
         if (!next) next = completionTail(draft, banks);
         setTail(next && next.length > 0 ? next : null);
-      }, [draft, revision, banks, blocked, model]);
+      }, [draft, revision, banks, blocked, model, focused, engaged]);
 
       useEffect(() => {
         if (!tail) {
@@ -420,9 +544,12 @@ window.__ModuleLoader__.load({
           if (!tailRef.current) return;
           if (!focusedEditor()) return;
           if (event.key === 'Tab' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
-            event.preventDefault();
-            event.stopPropagation();
-            accept();
+            // Consume the key only when the ghost actually landed; otherwise the
+            // user keeps native Tab behaviour instead of a dead key.
+            if (accept()) {
+              event.preventDefault();
+              event.stopPropagation();
+            }
             return;
           }
           if (event.key === 'Escape') {
@@ -449,7 +576,8 @@ window.__ModuleLoader__.load({
           display: 'inline-flex',
           alignItems: 'center',
           gap: '6px',
-          maxWidth: '70vw',
+          maxWidth: layout ? `${layout.room}px` : '70vw',
+          overflow: 'hidden',
           whiteSpace: 'pre',
           pointerEvents: 'none',
           userSelect: 'none',
@@ -467,7 +595,8 @@ window.__ModuleLoader__.load({
     /** Suggested continuation prompt offered under the card while the draft is empty. */
     function ComposerSuggestionDock(props) {
       const { inputActions } = props;
-      const { draft, revision, language, banks, blocked } = useComposerState(props);
+      const state = useComposerState(props);
+      const { draft, revision, language, banks, blocked, focused, engaged } = state;
       const [recommend, setRecommend] = useState(null);
       const recommendRef = useRef(null);
       const dismissRef = useRef(null);
@@ -476,13 +605,15 @@ window.__ModuleLoader__.load({
       recommendRef.current = recommend;
 
       const model = useModelSuggestion({
-        props, draft, revision, language, blocked,
+        props, draft, revision, language, blocked, focused, engaged,
+        imeEpoch: state.imeEpoch, composing: state.composing,
         mode: 'recommend',
         idleMs: 300,
       });
 
       useEffect(() => {
-        if (blocked || draft !== '') {
+        // Nothing is requested, and nothing is shown, before the user touches the composer.
+        if (blocked || !engaged || !focused || draft !== '') {
           setRecommend(null);
           return;
         }
@@ -495,16 +626,16 @@ window.__ModuleLoader__.load({
           return;
         }
         const base = Number.isFinite(revision) ? revision : 0;
-        setRecommend(pick(banks.recommends, hashOf(props.sessionId) + base));
-      }, [draft, revision, banks, blocked, model, props.sessionId]);
+        setRecommend(pick(banks.recommends, hashOf(`${props.sessionId}:${language}`) + base));
+      }, [draft, revision, banks, blocked, model, props.sessionId, focused, engaged, language]);
 
       const accept = useCallback(() => {
         const text = recommendRef.current;
-        if (!text) return;
-        if (insertAtCaret(inputActions, text, draftRef.current)) {
-          recommendRef.current = null;
-          setRecommend(null);
-        }
+        if (!text) return false;
+        if (!insertAtCaret(inputActions, text, draftRef.current)) return false;
+        recommendRef.current = null;
+        setRecommend(null);
+        return true;
       }, [inputActions]);
 
       useEffect(() => {
@@ -513,9 +644,10 @@ window.__ModuleLoader__.load({
           if (!recommendRef.current) return;
           if (!focusedEditor()) return;
           if (event.key === 'Tab' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && !event.isComposing) {
-            event.preventDefault();
-            event.stopPropagation();
-            accept();
+            if (accept()) {
+              event.preventDefault();
+              event.stopPropagation();
+            }
             return;
           }
           if (event.key === 'Escape') {
@@ -536,6 +668,10 @@ window.__ModuleLoader__.load({
         type: 'button',
         'data-composer-suggestion-hint': '',
         title: props.t ? props.t('hint') : undefined,
+        onMouseDown: (event) => {
+          // Keep the caret and selection in the editor.
+          event.preventDefault();
+        },
         onClick: accept,
         style: {
           display: 'inline-flex',
@@ -587,6 +723,23 @@ window.__ModuleLoader__.load({
       }, ComposerSuggestionDock));
     }
 
-    return { inject, apply };
+    return {
+      inject,
+      apply,
+      __internals: {
+        banksFor,
+        completionTail,
+        insertAtCaret,
+        looksSecret,
+        hasCjk,
+        resolveLanguage,
+        codePointLength,
+        cacheGet,
+        cacheSet,
+        pick,
+        hashOf,
+        MIN_ROOM_PX,
+      },
+    };
   },
 });

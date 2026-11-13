@@ -9,13 +9,19 @@
 
 const ROUTE = '/dsh-composer-suggestion/suggest';
 const MAX_BODY_BYTES = 32 * 1024;
+const MAX_DRAFT_CHARS = 400;
 const MAX_MESSAGE_CHARS = 1200;
 const MAX_CONTEXT_MESSAGES = 6;
 const MAX_SUGGESTION_CHARS = 120;
 const REQUEST_BUDGET_MS = 9000;
+const SESSION_BURST = 30;
+const SESSION_WINDOW_MS = 60_000;
 
 export const name = 'composer-suggestion-host';
 export const inject = ['webServer', 'sessions', 'llm'];
+
+/** Credential shapes that must never leave the composer. */
+const SECRET_PATTERN = /(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]+PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|token|password|secret)\s*[:=]\s*\S{8,})/iu;
 
 /** Plain-text projection of one stored message. */
 function messageText(message) {
@@ -66,13 +72,14 @@ function systemPrompt(mode, language) {
     return [
       'You complete the unfinished draft a developer is typing into an AI coding agent.',
       'Reply with ONLY the text that comes next, continuing the draft seamlessly from its final character.',
-      'No quotes, no prefix, no explanation, no markdown fence, at most one short sentence.',
+      'Never repeat or paraphrase the draft itself.',
+      'No quotes, no prefix, no explanation, no markdown fence, at most one short sentence under 60 characters.',
       `Write in ${target}, matching the draft's language.`,
     ].join('\n');
   }
   return [
     'You propose the single next prompt a developer is most likely to send to an AI coding agent, given the conversation so far.',
-    'Reply with ONLY that prompt: one short sentence a user would actually type.',
+    'Reply with ONLY that prompt: one short imperative sentence a user would actually type, under 60 characters.',
     'No quotes, no numbering, no explanation, no markdown.',
     `Write in ${target}, matching the conversation's language.`,
   ].join('\n');
@@ -88,12 +95,11 @@ function userPrompt(mode, context, draft) {
   } else {
     lines.push('Conversation so far: (empty)');
   }
+  lines.push('');
   if (mode === 'continuation') {
-    lines.push('');
     lines.push(`Unfinished draft: ${draft}`);
     lines.push('Provide only the continuation text.');
   } else {
-    lines.push('');
     lines.push('Provide only the next prompt.');
   }
   return lines.join('\n');
@@ -131,15 +137,71 @@ async function generate(ctx, { mode, context, draft, language, signal }) {
   return text.trim();
 }
 
-/** Remove wrapping quotes and stray fences a model may add around one line. */
-function tidy(text) {
+/** Drop wrapping quotes, fences and an echoed draft from model output. */
+function tidy(text, draft) {
   let value = String(text || '').trim();
   value = value.replace(/^```[a-zA-Z]*\s*/u, '').replace(/```$/u, '').trim();
   const quoted = /^["'“”『「'](?<inner>[\s\S]*?)["'“”』」']$/u.exec(value);
   if (quoted && quoted.groups && quoted.groups.inner) value = quoted.groups.inner.trim();
-  const lines = value.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
-  const first = lines.length > 0 ? lines[0] : '';
-  return first.slice(0, MAX_SUGGESTION_CHARS);
+  const firstLine = value.split(/\r?\n/u).map((line) => line.trim()).find((line) => line.length > 0) || '';
+  let result = firstLine;
+  const echo = String(draft || '').trim();
+  if (echo.length > 0 && result.startsWith(echo)) {
+    // An exact echo leaves nothing to append; a longer echo keeps only the tail.
+    result = result.slice(echo.length).trim();
+  }
+  return cutAtBoundary(result, MAX_SUGGESTION_CHARS);
+}
+
+/** Cut at the last sentence or word boundary instead of mid-token. */
+function cutAtBoundary(text, limit) {
+  const value = String(text || '').trim();
+  if (value.length <= limit) return value;
+  const head = value.slice(0, limit);
+  const boundary = Math.max(
+    head.lastIndexOf('。'), head.lastIndexOf('．'), head.lastIndexOf('，'),
+    head.lastIndexOf('、'), head.lastIndexOf('；'), head.lastIndexOf('！'), head.lastIndexOf('？'),
+    head.lastIndexOf('. '), head.lastIndexOf(', '), head.lastIndexOf('; '), head.lastIndexOf(' '),
+  );
+  if (boundary >= Math.floor(limit * 0.3)) {
+    return head.slice(0, boundary + 1).trim();
+  }
+  return `${head.slice(0, limit - 1).trim()}…`;
+}
+
+/** One token bucket per Session, so a page cannot spend the model budget. */
+const buckets = new Map();
+
+function takeToken(sessionId, now) {
+  const key = sessionId || 'anonymous';
+  const current = buckets.get(key);
+  if (current === undefined || now - current.windowStart >= SESSION_WINDOW_MS) {
+    buckets.set(key, { windowStart: now, count: 1 });
+    return true;
+  }
+  if (current.count >= SESSION_BURST) return false;
+  current.count += 1;
+  return true;
+}
+
+/** Accept only a same-origin browser request addressed to the loopback host. */
+function requestAllowed(request) {
+  if (request.method !== 'POST' || request.headers['x-composer-suggestion'] !== '1') return 'method';
+  const host = String(request.headers.host || '');
+  if (!/^(?:127\.0\.0\.1|localhost|\[::1\]):\d+$/u.test(host)) return 'host';
+  const site = request.headers['sec-fetch-site'];
+  if (site !== undefined && site !== 'same-origin' && site !== 'none') return 'origin';
+  const origin = request.headers.origin;
+  if (origin !== undefined) {
+    let parsed;
+    try {
+      parsed = new URL(origin);
+    } catch (error) {
+      return 'origin';
+    }
+    if (`${parsed.host}` !== host) return 'origin';
+  }
+  return null;
 }
 
 function readBody(request) {
@@ -177,10 +239,9 @@ function send(response, status, payload) {
 }
 
 async function handle(ctx, request, response) {
-  // Reject anything that is not an in-page request: a cross-origin browser call
-  // must preflight because of this header, and no CORS headers are sent.
-  if (request.method !== 'POST' || request.headers['x-composer-suggestion'] !== '1') {
-    send(response, 405, { error: 'method' });
+  const refusal = requestAllowed(request);
+  if (refusal !== null) {
+    send(response, 405, { error: refusal });
     return;
   }
   let payload;
@@ -191,9 +252,19 @@ async function handle(ctx, request, response) {
     return;
   }
   const mode = payload && payload.mode === 'continuation' ? 'continuation' : 'recommend';
-  const draft = typeof payload?.draft === 'string' ? payload.draft.slice(0, 400) : '';
+  const draft = typeof payload?.draft === 'string' ? payload.draft.slice(0, MAX_DRAFT_CHARS) : '';
   const language = typeof payload?.language === 'string' ? payload.language : 'en';
   const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : undefined;
+
+  if (SECRET_PATTERN.test(draft)) {
+    send(response, 200, { mode, text: '', skipped: 'secret' });
+    return;
+  }
+  if (!takeToken(sessionId, Date.now())) {
+    send(response, 429, { error: 'rate-limited' });
+    return;
+  }
+
   let session;
   if (sessionId !== undefined) {
     try {
@@ -206,9 +277,11 @@ async function handle(ctx, request, response) {
   const signal = AbortSignal.timeout(REQUEST_BUDGET_MS);
   try {
     const raw = await generate(ctx, { mode, context, draft, language, signal });
-    send(response, 200, { mode, text: tidy(raw) });
+    send(response, 200, { mode, text: tidy(raw, draft) });
   } catch (error) {
-    send(response, 200, { mode, text: '', error: String((error && error.message) || error).slice(0, 200) });
+    const message = String((error && error.message) || error).slice(0, 200);
+    console.warn(`composer-suggestion: ${mode} request failed: ${message}`);
+    send(response, 200, { mode, text: '', error: message });
   }
 }
 
@@ -218,8 +291,9 @@ export function apply(ctx) {
     path: ROUTE,
     handler: (request, response) => {
       handle(ctx, request, response).catch((error) => {
+        console.warn(`composer-suggestion: handler failed: ${String((error && error.message) || error)}`);
         try {
-          send(response, 400, { error: String((error && error.message) || error).slice(0, 200) });
+          send(response, 400, { error: 'handler-failed' });
         } catch (nested) {
           response.destroy();
         }
@@ -227,3 +301,6 @@ export function apply(ctx) {
     },
   }), 'composer-suggestion: suggestion route');
 }
+
+/** Pure helpers, exported for the test harness. */
+export const __internals = { tidy, cutAtBoundary, requestAllowed, takeToken, recentContext, SECRET_PATTERN };

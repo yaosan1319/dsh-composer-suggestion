@@ -1,6 +1,6 @@
 {
   "name": "dsh-composer-suggestion",
-  "version": "1.1.0",
+  "version": "1.3.0",
   "description": "ChatGPT-style ghost continuation prompt inside the DSH composer, accepted with Tab",
   "type": "module",
   "license": "MIT",
@@ -37,6 +37,7 @@
     "icon.svg",
     "README.md",
     "README.zh.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "dsh": {
@@ -53,5 +54,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "scripts": {
+    "test": "node test/host.test.mjs && node test/client.test.mjs"
   }
 }
